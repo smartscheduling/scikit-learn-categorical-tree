@@ -14,7 +14,7 @@
 #
 # Licence: BSD 3 clause
 
-from libc.stdlib cimport calloc, free, realloc, qsort
+from libc.stdlib cimport calloc, free, realloc, qsort, malloc
 
 from libc.string cimport memcpy, memset
 from libc.math cimport log as ln
@@ -72,6 +72,10 @@ cdef enum:
     # particularly tiny on Windows/MSVC.
     RAND_R_MAX = 0x7FFFFFFF
 
+
+cdef int CONTINUOUS = 0
+cdef int CATEGORICAL = 1
+
 # Repeat struct definition for numpy
 NODE_DTYPE = np.dtype({
     'names': ['left_child', 'right_child', 'feature', 'threshold', 'impurity',
@@ -89,6 +93,13 @@ NODE_DTYPE = np.dtype({
     ]
 })
 
+cdef int is_left_var(DTYPE_t x, int split,
+                     int* categories) nogil:
+    """Return whether the category belong to the left branch, according to a
+    split"""
+    cdef int i = categories[int(x)]
+    return (split >> i) & 1
+
 
 # =============================================================================
 # Criterion
@@ -97,9 +108,10 @@ NODE_DTYPE = np.dtype({
 cdef class Criterion:
     """Interface for impurity criteria."""
 
-    cdef void init(self, DOUBLE_t* y, SIZE_t y_stride, DOUBLE_t* sample_weight,
-                   double weighted_n_samples, SIZE_t* samples, SIZE_t start,
-                   SIZE_t end) nogil:
+    cdef void init(self, DOUBLE_t* y, SIZE_t y_stride,
+                   DOUBLE_t* sample_weight, double weighted_n_samples,
+                   SIZE_t* samples, SIZE_t start, SIZE_t end,
+                   bint is_categorical) nogil:
         """Initialize the criterion at node samples[start:end] and
            children samples[start:start] and samples[start:end]."""
         pass
@@ -111,6 +123,10 @@ cdef class Criterion:
     cdef void update(self, SIZE_t new_pos) nogil:
         """Update the collected statistics by moving samples[pos:new_pos] from
            the right child to the left child."""
+        pass
+
+    cdef void update_factors(self, PARTITION_t partition) nogil:
+        """Update the collected statistics by defining the categorical split"""
         pass
 
     cdef double node_impurity(self) nogil:
@@ -225,7 +241,8 @@ cdef class ClassificationCriterion(Criterion):
 
     cdef void init(self, DOUBLE_t* y, SIZE_t y_stride,
                    DOUBLE_t* sample_weight, double weighted_n_samples,
-                   SIZE_t* samples, SIZE_t start, SIZE_t end) nogil:
+                   SIZE_t* samples, SIZE_t start, SIZE_t end,
+                   bint is_categorical) nogil:
         """Initialize the criterion at node samples[start:end] and
            children samples[start:start] and samples[start:end]."""
         # Initialize fields
@@ -343,6 +360,50 @@ cdef class ClassificationCriterion(Criterion):
         self.weighted_n_right -= diff_w
 
         self.pos = new_pos
+
+    cdef void update_factors(self, PARTITION_t partition) nogil:
+        """Update the collected statistics by defining the categorical split"""
+        cdef DOUBLE_t* y = self.y
+        cdef SIZE_t y_stride = self.y_stride
+        cdef DOUBLE_t* sample_weight = self.sample_weight
+        cdef SIZE_t n_outputs = self.n_outputs
+        cdef SIZE_t* samples = self.samples
+        cdef SIZE_t label_count_stride = self.label_count_stride
+        cdef double* label_count_left = self.label_count_left
+        cdef double* label_count_right = self.label_count_right
+        cdef SIZE_t start = self.start
+        cdef SIZE_t end = self.end
+        cdef int left_leaf
+
+        cdef SIZE_t i
+        cdef SIZE_t k
+        cdef SIZE_t label_index
+        cdef DOUBLE_t w = 1.0
+        cdef DOUBLE_t diff_w = 0.0
+
+        for label_index in xrange(self.n_outputs):
+            label_count_left[label_index] = 0
+            label_count_right[label_index] = 0
+
+        for p in range(start, end):
+            i = samples[p]
+
+            if sample_weight != NULL:
+                w = sample_weight[i]
+
+            for k in range(n_outputs):
+                label_index = (k * label_count_stride +
+                               <SIZE_t> y[i * y_stride + k])
+                left_leaf = (partition >> i) & 0x1
+                if left_leaf:
+                    label_count_left[label_index] += w
+                    diff_w += w
+                else:
+                    label_count_right[label_index] -= w
+                    diff_w -= w
+
+        self.weighted_n_left += diff_w
+        self.weighted_n_right -= diff_w
 
     cdef double node_impurity(self) nogil:
         pass
@@ -650,9 +711,10 @@ cdef class RegressionCriterion(Criterion):
     def __setstate__(self, d):
         pass
 
-    cdef void init(self, DOUBLE_t* y, SIZE_t y_stride, DOUBLE_t* sample_weight,
-                   double weighted_n_samples, SIZE_t* samples, SIZE_t start,
-                   SIZE_t end) nogil:
+    cdef void init(self, DOUBLE_t* y, SIZE_t y_stride,
+                   DOUBLE_t* sample_weight, double weighted_n_samples,
+                   SIZE_t* samples, SIZE_t start, SIZE_t end,
+                   bint is_categorical) nogil:
         """Initialize the criterion at node samples[start:end] and
            children samples[start:start] and samples[start:end]."""
         # Initialize fields
@@ -821,6 +883,70 @@ cdef class RegressionCriterion(Criterion):
 
         self.pos = new_pos
 
+    cdef void update_factors(self, PARTITION_t partition) nogil:
+        """Update the collected statistics by defining the categorical split"""
+        cdef DOUBLE_t* y = self.y
+        cdef SIZE_t y_stride = self.y_stride
+        cdef DOUBLE_t* sample_weight = self.sample_weight
+
+        cdef SIZE_t* samples = self.samples
+        cdef SIZE_t pos = self.pos
+
+        cdef SIZE_t n_outputs = self.n_outputs
+        cdef double* mean_left = self.mean_left
+        cdef double* mean_right = self.mean_right
+        cdef double* sq_sum_left = self.sq_sum_left
+        cdef double* sq_sum_right = self.sq_sum_right
+        cdef double* var_left = self.var_left
+        cdef double* var_right = self.var_right
+        cdef double* sum_left = self.sum_left
+        cdef double* sum_right = self.sum_right
+
+        cdef double weighted_n_left = self.weighted_n_left
+        cdef double weighted_n_right = self.weighted_n_right
+
+        cdef SIZE_t start = self.start
+        cdef SIZE_t end = self.end
+        cdef int left_leaf
+
+        cdef SIZE_t i
+        cdef SIZE_t p
+        cdef SIZE_t k
+        cdef DOUBLE_t w = 1.0
+        cdef DOUBLE_t diff_w = 0.0
+        cdef DOUBLE_t y_ik, w_y_ik
+
+        for p in range(start, end):
+            i = samples[p]
+
+            if sample_weight != NULL:
+                w = sample_weight[i]
+
+            for k in range(n_outputs):
+                left_leaf = (partition >> i) & 0x1
+                y_ik = y[i * y_stride + k]
+                w_y_ik = w * y_ik
+
+                if left_leaf:
+                    sum_left[k] += w_y_ik
+                    sq_sum_left[k] += w_y_ik * y_ik
+                else:
+                    sum_right[k] += w_y_ik
+                    sq_sum_right[k] += w_y_ik * y_ik
+
+            diff_w += w
+
+        weighted_n_left += diff_w
+        weighted_n_right -= diff_w
+
+        for k in range(n_outputs):
+            mean_left[k] = sum_left[k] / weighted_n_left
+            mean_right[k] = sum_right[k] / weighted_n_right
+            var_left[k] = (sq_sum_left[k] / weighted_n_left -
+                           mean_left[k] * mean_left[k])
+            var_right[k] = (sq_sum_right[k] / weighted_n_right -
+                            mean_right[k] * mean_right[k])
+
     cdef double node_impurity(self) nogil:
         pass
 
@@ -921,8 +1047,15 @@ cdef inline void _init_split(SplitRecord* self, SIZE_t start_pos) nogil:
 
 cdef class Splitter:
     def __cinit__(self, Criterion criterion, SIZE_t max_features,
+<<<<<<< HEAD
                   SIZE_t min_samples_leaf, double min_weight_leaf,
                   object random_state):
+=======
+                  SIZE_t min_samples_leaf,
+                  double min_weight_leaf,
+                  object random_state,
+                  bint is_categorical):
+>>>>>>> b84530e78e849bc351bc195781d31c2807f48ff5
         self.criterion = criterion
 
         self.samples = NULL
@@ -939,6 +1072,7 @@ cdef class Splitter:
         self.min_samples_leaf = min_samples_leaf
         self.min_weight_leaf = min_weight_leaf
         self.random_state = random_state
+        self.is_categorical = is_categorical
 
     def __dealloc__(self):
         """Destructor."""
@@ -1010,7 +1144,8 @@ cdef class Splitter:
                             self.weighted_n_samples,
                             self.samples,
                             start,
-                            end)
+                            end,
+                            self.is_categorical)
 
         weighted_n_node_samples[0] = self.criterion.weighted_n_node_samples
 
@@ -1066,7 +1201,8 @@ cdef class BestSplitter(BaseDenseSplitter):
                                self.max_features,
                                self.min_samples_leaf,
                                self.min_weight_leaf,
-                               self.random_state), self.__getstate__())
+                               self.random_state,
+                               self.is_categorical), self.__getstate__())
 
     cdef void node_split(self, double impurity, SplitRecord* split,
                          SIZE_t* n_constant_features) nogil:
@@ -1082,17 +1218,25 @@ cdef class BestSplitter(BaseDenseSplitter):
 
         cdef DTYPE_t* X = self.X
         cdef DTYPE_t* Xf = self.feature_values
+        cdef SIZE_t* Xi
+        cdef DTYPE_t* y
         cdef SIZE_t X_sample_stride = self.X_sample_stride
         cdef SIZE_t X_fx_stride = self.X_fx_stride
         cdef SIZE_t max_features = self.max_features
-        cdef SIZE_t min_samples_leaf = self.min_samples_leaf
         cdef double min_weight_leaf = self.min_weight_leaf
         cdef UINT32_t* random_state = &self.rand_r_state
 
         cdef SplitRecord best, current
 
+        cdef int n_categorical = 0  # How many categorical features #TODO
+        cdef DTYPE_t category
+        cdef SIZE_t* categories     # The link between a category and
+                                    # 1..n_categories
+        cdef SIZE_t* categories_tmp
+
         cdef SIZE_t f_i = n_features
-        cdef SIZE_t f_j, p, tmp
+        cdef SIZE_t c_i = n_features - n_categorical
+        cdef SIZE_t f_j, p, tmp, right_p, i
         cdef SIZE_t n_visited_features = 0
         # Number of features discovered to be constant during the split search
         cdef SIZE_t n_found_constants = 0
@@ -1103,6 +1247,7 @@ cdef class BestSplitter(BaseDenseSplitter):
         cdef SIZE_t n_total_constants = n_known_constants
         cdef DTYPE_t current_feature_value
         cdef SIZE_t partition_end
+        cdef bint is_constant
 
         _init_split(&best, end)
 
@@ -1123,20 +1268,31 @@ cdef class BestSplitter(BaseDenseSplitter):
 
             n_visited_features += 1
 
+            # TODO
             # Loop invariant: elements of features in
             # - [:n_drawn_constant[ holds drawn and known constant features;
             # - [n_drawn_constant:n_known_constant[ holds known constant
             #   features that haven't been drawn yet;
             # - [n_known_constant:n_total_constant[ holds newly found constant
             #   features;
-            # - [n_total_constant:f_i[ holds features that haven't been drawn
-            #   yet and aren't constant apriori.
-            # - [f_i:n_features[ holds features that have been drawn
-            #   and aren't constant.
+            # - [n_total_constant:c_i[ holds features that haven't been drawn
+            #   yet and aren't constant apriori and are continuous
+            # - [c_i:f_i[ holds features that haven't been drawn
+            #   yet  and aren't constant apriori and are categorical
+            # - [f_i:n_features_continuous[ holds features that have been drawn
+            #   and aren't constant and are continuous.
+            # - [n_features_continuous:n_features[ holds features that have been
+            #   drawn and aren't constant and are continuous
 
             # Draw a feature at random
+<<<<<<< HEAD
             f_j = rand_int(n_drawn_constants, f_i - n_found_constants,
                            random_state)
+=======
+            # f_j is in the interval [n_drawn_constant, f_i - n_found_constants[
+            f_j = rand_int(f_i - n_drawn_constants - n_found_constants,
+                           random_state) + n_drawn_constants
+>>>>>>> b84530e78e849bc351bc195781d31c2807f48ff5
 
             if f_j < n_known_constants:
                 # f_j in the interval [n_drawn_constants, n_known_constants[
@@ -1153,71 +1309,67 @@ cdef class BestSplitter(BaseDenseSplitter):
 
                 current.feature = features[f_j]
 
-                # Sort samples along that feature; first copy the feature
-                # values for the active samples into Xf, s.t.
-                # Xf[i] == X[samples[i], j], so the sort uses the cache more
-                # effectively.
-                for p in range(start, end):
-                    Xf[p] = X[X_sample_stride * samples[p] +
-                              X_fx_stride * current.feature]
+                if f_j >= c_i:
+                    # f_j is categorical
+                
+                    Xi = <SIZE_t*>malloc(sizeof(SIZE_t) * (end-start+1))
+                    y = <DTYPE_t*>malloc(sizeof(DTYPE_t) * (end-start+1))
+                    is_constant = True
+                    for p in range(start, end):
+                        Xi[p] = int(X[X_sample_stride * samples[p] +
+                                      X_fx_stride * current.feature])
+                        y[p] = self.y[p]
+                        if Xi[p] != Xi[0]:
+                            is_constant = False
+    
+                    if is_constant:
+                        # If f_j is constant so we add it to the constants features
+                        features[f_j] = features[n_total_constants]
+                        features[n_total_constants] = current.feature
+    
+                        n_found_constants += 1
+                        n_total_constants += 1
+                        continue
 
-                sort(Xf + start, samples + start, end - start)
-
-                if Xf[end - 1] <= Xf[start] + FEATURE_THRESHOLD:
-                    features[f_j] = features[n_total_constants]
-                    features[n_total_constants] = current.feature
-
-                    n_found_constants += 1
-                    n_total_constants += 1
-
-                else:
                     f_i -= 1
                     features[f_i], features[f_j] = features[f_j], features[f_i]
 
-                    # Evaluate all splits
-                    self.criterion.reset()
-                    p = start
+                    categories = <int *>malloc(sizeof(int)) # TODO
+                    self._categorical_feature_split(Xi, y, &current, &best,
+                                                    categories, impurity)
 
-                    while p < end:
-                        while (p + 1 < end and
-                               Xf[p + 1] <= Xf[p] + FEATURE_THRESHOLD):
-                            p += 1
+                    free(Xi)
+                    free(y)
 
-                        # (p + 1 >= end) or (X[samples[p + 1], current.feature] >
-                        #                    X[samples[p], current.feature])
-                        p += 1
-                        # (p >= end) or (X[samples[p], current.feature] >
-                        #                X[samples[p - 1], current.feature])
+                else:
+                    # f_j is continuous
 
-                        if p < end:
-                            current.pos = p
+                    # Sort samples along that feature; first copy the feature
+                    # values for the active samples into Xf, s.t.
+                    # Xf[i] == X[samples[i], j], so the sort uses the cache more
+                    # effectively.
+                    for p in range(start, end):
+                        Xf[p] = X[X_sample_stride * samples[p] +
+                                  X_fx_stride * current.feature]
 
-                            # Reject if min_samples_leaf is not guaranteed
-                            if (((current.pos - start) < min_samples_leaf) or
-                                    ((end - current.pos) < min_samples_leaf)):
-                                continue
+                    sort(Xf + start, samples + start, end - start)
 
-                            self.criterion.update(current.pos)
+                    if Xf[end - 1] <= Xf[start] + FEATURE_THRESHOLD:
+                        # If f_j is constant so we add it to the constants features
+                        features[f_j] = features[n_total_constants]
+                        features[n_total_constants] = current.feature
 
-                            # Reject if min_weight_leaf is not satisfied
-                            if ((self.criterion.weighted_n_left < min_weight_leaf) or
-                                    (self.criterion.weighted_n_right < min_weight_leaf)):
-                                continue
+                        n_found_constants += 1
+                        n_total_constants += 1
+                        continue
 
-                            current.improvement = self.criterion.impurity_improvement(impurity)
+                    f_i -= 1
+                    features[f_i], features[f_j] = features[f_j], features[f_i]
 
-                            if current.improvement > best.improvement:
-                                self.criterion.children_impurity(&current.impurity_left,
-                                                                 &current.impurity_right)
-                                current.threshold = (Xf[p - 1] + Xf[p]) / 2.0
-
-                                if current.threshold == Xf[p]:
-                                    current.threshold = Xf[p - 1]
-
-                                best = current  # copy
+                    self._continuous_feature_split(Xf, &current, &best, impurity)
 
         # Reorganize into samples[start:best.pos] + samples[best.pos:end]
-        if best.pos < end:
+        if best.split_type == CONTINUOUS and best.pos < end:
             partition_end = end
             p = start
 
@@ -1233,6 +1385,27 @@ cdef class BestSplitter(BaseDenseSplitter):
                     samples[partition_end] = samples[p]
                     samples[p] = tmp
 
+        # Reorganize into samples[start:best.pos] + samples[best.pos:end]
+        if best.split_type == CATEGORICAL:
+            p = start
+            right_p = end
+            while p < right_p:
+                if is_left_var(
+                    X[X_sample_stride * samples[p] +
+                                    X_fx_stride * best.feature],
+                    best.partition, categories):
+                        p += 1
+                else:
+                    while not is_left_var(
+                        X[X_sample_stride * samples[right_p] +
+                                        X_fx_stride * best.feature],
+                        best.partition, categories) and p < right_p:
+                            right_p -= 1
+                    tmp = samples[right_p]
+                    samples[right_p] = samples[p]
+                    samples[p] = tmp
+                    p += 1
+
         # Respect invariant for constant features: the original order of
         # element in features[:n_known_constants] must be preserved for sibling
         # and child nodes
@@ -1247,6 +1420,180 @@ cdef class BestSplitter(BaseDenseSplitter):
         split[0] = best
         n_constant_features[0] = n_total_constants
 
+    cdef void _categorical_feature_split(self, SIZE_t* Xi, DTYPE_t* y,
+                                         SplitRecord* current,
+                                         SplitRecord* best,
+                                         SIZE_t* categories,
+                                         double impurity) nogil:
+        cdef SIZE_t max_categories = 0
+        cdef SIZE_t current_item
+        cdef int n_categories       # How many categories are in the column
+        cdef PARTITION_t partition
+        cdef SIZE_t p
+
+        # We find the categories that are in the data
+        for p in xrange(self.start, self.end):
+            current_item = Xi[p]
+            if current_item > max_categories:
+                # We resize the array
+                categories_tmp = <int *>malloc(
+                    sizeof(int) * current_item)
+                memcpy(categories_tmp, categories,
+                       sizeof(int) * max_categories)
+                for i in xrange(max_categories+1, current_item):
+                    categories_tmp[i] = 0
+                free(categories)
+                categories = categories_tmp
+                max_categories = current_item
+            categories[current_item] = 1
+        # Now we can create a mapping between the categories that
+        # are in the data and 1...n_categories
+        n_categories = 0
+        for i in xrange(0, max_categories):
+            if categories[i] > 0:
+                categories[i] = n_categories
+                n_categories += 1
+
+        # First we count the outcomes per category, so we don't
+        # have to iterate through all the data after that
+
+        self.criterion.reset()
+        # We test all the combinations of categories. Not efficient
+        # if there is many dummies.
+
+        if self.y_stride == 1 and self.criterion.n_outputs == 1:
+            # We are doing regression or binomial classification
+            # In this case, the best split is c_j1...c_jk and
+            # c_j(k+1)...c_jn, with the categories c_i are
+            # reorganized with mean(y[c_ji]) <= mean( y[c_j(i+1)])
+            sort(y + self.start, Xi + self.start, self.end - self.start)
+            category = -1
+            partition = 0x0
+            p = self.start - 1
+            while p < self.end:
+                p += 1
+                while (p + 1 < self.end and
+                       Xi[p + 1] == category):
+                    p += 1
+                if p < self.end:
+                    partition |= 1 << Xi[p]
+                    # Reject if min_samples_leaf is not guaranteed
+                    if (((p - self.start) < self.min_samples_leaf) or
+                            ((self.end - p) < self.min_samples_leaf)):
+                        continue
+
+                    self.criterion.update(p)
+
+                    # Reject if min_weight_leaf is not satisfied
+                    if ((self.criterion.weighted_n_left < self.min_weight_leaf) or
+                            (self.criterion.weighted_n_right < self.min_weight_leaf)):
+                        continue
+
+                    current.improvement = self.criterion.impurity_improvement(impurity)
+
+                    if current.improvement > best.improvement:
+                        self.criterion.children_impurity(&current.impurity_left,
+                                                         &current.impurity_right)
+                        current.partition = partition #copy
+                        current.split_type = CATEGORICAL
+                        best = current  # copy
+            return # We don't use the multi-output fallback
+
+        # TODO sample splits otherwise if n_categories>=8
+        for partition in xrange(2**(n_categories-1)):
+            # The first category is always in the right branch.
+            # It doesn't change anything because of symmetry
+
+            self.criterion.update_factors(partition)
+
+            # Reject if min_weight_leaf is not satisfied
+            if ((self.criterion.weighted_n_left < self.min_weight_leaf) or
+                    (self.criterion.weighted_n_right < self.min_weight_leaf)):
+                continue
+
+            current.improvement = self.criterion.impurity_improvement(impurity)
+
+            if current.improvement > best.improvement:
+                self.criterion.children_impurity(&current.impurity_left,
+                                                 &current.impurity_right)
+                best.impurity_left = current.impurity_left
+                best.impurity_right = current.impurity_right
+                best.improvement = current.improvement
+                best.partition = partition
+                best.feature = current.feature
+
+                best = current  # copy
+                best.split_type = CATEGORICAL
+
+            current.impurity_left = 0
+            current.impurity_right = 0
+            current.improvement = 0
+            # Example loop through categories
+            # for i in xrange(n_categories):
+            #    category = categories[i] #TODO check
+            #    is_left = (split >> i) & 1
+            if current.improvement > best.improvement:
+                best.impurity_left = current.impurity_left
+                best.impurity_right = current.impurity_right
+                best.improvement = current.improvement
+                best.feature = current.feature
+                best.partition = partition
+                best.split_type = CATEGORICAL
+
+    cdef void _continuous_feature_split(self, DTYPE_t* Xf,
+                                         SplitRecord* current,
+                                         SplitRecord* best,
+                                         double impurity) nogil:
+        cdef SIZE_t p
+
+        # Evaluate all splits
+        self.criterion.reset()
+        p = self.start
+
+        while p < self.end:
+            while (p + 1 < self.end and
+                   Xf[p + 1] <= Xf[p] + FEATURE_THRESHOLD):
+                p += 1
+
+            # (p + 1 >= end) or (X[samples[p + 1], current.feature] >
+            #                    X[samples[p], current.feature])
+            p += 1
+            # (p >= end) or (X[samples[p], current.feature] >
+            #                X[samples[p - 1], current.feature])
+
+            if p < self.end:
+                current.pos = p
+
+                # Reject if min_samples_leaf is not guaranteed
+                if (((current.pos - self.start) < self.min_samples_leaf) or
+                        ((self.end - current.pos) < self.min_samples_leaf)):
+                    continue
+
+                self.criterion.update(current.pos)
+
+                # Reject if min_weight_leaf is not satisfied
+                if ((self.criterion.weighted_n_left < self.min_weight_leaf) or
+                        (self.criterion.weighted_n_right < self.min_weight_leaf)):
+                    continue
+
+                current.improvement = self.criterion.impurity_improvement(impurity)
+
+                if current.improvement > best.improvement:
+                    self.criterion.children_impurity(&current.impurity_left,
+                                                     &current.impurity_right)
+                    best.impurity_left = current.impurity_left
+                    best.impurity_right = current.impurity_right
+                    best.improvement = current.improvement
+                    best.pos = current.pos
+                    best.feature = current.feature
+
+                    current.threshold = (Xf[p - 1] + Xf[p]) / 2.0
+
+                    if current.threshold == Xf[p]:
+                        current.threshold = Xf[p - 1]
+
+                    best = current  # copy
+                    best.split_type = CONTINUOUS
 
 # Sort n-element arrays pointed to by Xf and samples, simultaneously,
 # by the values in Xf. Algorithm: Introsort (Musser, SP&E, 1997).
@@ -1365,7 +1712,8 @@ cdef class RandomSplitter(BaseDenseSplitter):
                                  self.max_features,
                                  self.min_samples_leaf,
                                  self.min_weight_leaf,
-                                 self.random_state), self.__getstate__())
+                                 self.random_state,
+                                 self.is_categorical), self.__getstate__())
 
     cdef void node_split(self, double impurity, SplitRecord* split,
                          SIZE_t* n_constant_features) nogil:
@@ -1573,7 +1921,8 @@ cdef class PresortBestSplitter(BaseDenseSplitter):
     def __cinit__(self, Criterion criterion, SIZE_t max_features,
                   SIZE_t min_samples_leaf,
                   double min_weight_leaf,
-                  object random_state):
+                  object random_state,
+                  bint is_categorical):
         # Initialize pointers
         self.X_old = NULL
         self.X_argsorted_ptr = NULL
@@ -1589,7 +1938,8 @@ cdef class PresortBestSplitter(BaseDenseSplitter):
                                       self.max_features,
                                       self.min_samples_leaf,
                                       self.min_weight_leaf,
-                                      self.random_state), self.__getstate__())
+                                      self.random_state,
+                                      self.is_categorical), self.__getstate__())
 
     cdef void init(self, object X,
                    np.ndarray[DOUBLE_t, ndim=2, mode="c"] y,

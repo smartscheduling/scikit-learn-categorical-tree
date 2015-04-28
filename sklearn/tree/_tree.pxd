@@ -16,7 +16,7 @@ ctypedef np.npy_float64 DOUBLE_t         # Type of y, sample_weight
 ctypedef np.npy_intp SIZE_t              # Type for indices and counters
 ctypedef np.npy_int32 INT32_t            # Signed 32 bit integer
 ctypedef np.npy_uint32 UINT32_t          # Unsigned 32 bit integer
-
+ctypedef np.npy_uint64 PARTITION_t       # Unsigned 64 bit integer
 
 # =============================================================================
 # Criterion
@@ -44,15 +44,18 @@ cdef class Criterion:
     cdef double weighted_n_left          # Weighted number of samples in the left node
     cdef double weighted_n_right         # Weighted number of samples in the right node
 
+    cdef bint is_categorical            # Whether the variable considered is categorical
+
     # The criterion object is maintained such that left and right collected
     # statistics correspond to samples[start:pos] and samples[pos:end].
 
     # Methods
     cdef void init(self, DOUBLE_t* y, SIZE_t y_stride, DOUBLE_t* sample_weight,
                    double weighted_n_samples, SIZE_t* samples, SIZE_t start,
-                   SIZE_t end) nogil
+                   SIZE_t end, bint is_categorical) nogil
     cdef void reset(self) nogil
     cdef void update(self, SIZE_t new_pos) nogil
+    cdef void update_factors(self, PARTITION_t partition) nogil
     cdef double node_impurity(self) nogil
     cdef void children_impurity(self, double* impurity_left,
                                 double* impurity_right) nogil
@@ -74,6 +77,8 @@ cdef struct SplitRecord:
     double improvement     # Impurity improvement given parent node.
     double impurity_left   # Impurity of the left split.
     double impurity_right  # Impurity of the right split.
+    int split_type         # Type of split: continuous or categorical
+    PARTITION_t partition  # If categorical, the categories of the left leaf
 
 
 cdef class Splitter:
@@ -105,6 +110,8 @@ cdef class Splitter:
     cdef DOUBLE_t* y
     cdef SIZE_t y_stride
     cdef DOUBLE_t* sample_weight
+
+    cdef bint is_categorical            # Whether the variable considered is categorical
 
     # The samples vector `samples` is maintained by the Splitter object such
     # that the samples contained in a node are contiguous. With this setting,
@@ -138,6 +145,19 @@ cdef class Splitter:
 
     cdef double node_impurity(self) nogil
 
+
+
+cdef class BestSplitter(Splitter):
+    cdef void _categorical_feature_split(self, SIZE_t* Xi, DTYPE_t* y,
+                                         SplitRecord* current,
+                                         SplitRecord* best,
+                                         SIZE_t* categories,
+                                         double impurity) nogil
+
+    cdef void _continuous_feature_split(self, DTYPE_t* Xf,
+                                         SplitRecord* current,
+                                         SplitRecord* best,
+                                         double impurity) nogil
 
 # =============================================================================
 # Tree
