@@ -611,7 +611,7 @@ class DecisionTreeClassifier(BaseDecisionTree, ClassifierMixin):
                  max_features=None,
                  random_state=None,
                  max_leaf_nodes=None,
-                 class_weight=None
+                 class_weight=None,
                  min_density=None,
                  categorical_features=None):
         super(DecisionTreeClassifier, self).__init__(
